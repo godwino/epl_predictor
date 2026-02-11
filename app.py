@@ -9,6 +9,7 @@ from predict_match import _predict_fixture
 
 DATA_DIR = Path(__file__).resolve().parent
 ARTIFACT_PATH = DATA_DIR / "advanced_model.pkl"
+OUTCOME_LABELS = {"H": "Home Win", "D": "Draw", "A": "Away Win"}
 
 
 @st.cache_data
@@ -58,19 +59,21 @@ def render_single_fixture(teams: list[str], artifact: dict) -> None:
 
     if st.button("Predict Result", type="primary"):
         pred = predict_one(home, away, artifact)
+        winner_key = max(["H", "D", "A"], key=lambda k: pred[k])
+        winner_label = OUTCOME_LABELS[winner_key]
+
+        st.success(f"Most likely outcome: {winner_label}")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Home Win", f"{pred['H'] * 100:.1f}%")
+        c2.metric("Draw", f"{pred['D'] * 100:.1f}%")
+        c3.metric("Away Win", f"{pred['A'] * 100:.1f}%")
 
         probs = pd.DataFrame(
             {
-                "Outcome": ["Home Win", "Draw", "Away Win"],
+                "Outcome": [OUTCOME_LABELS["H"], OUTCOME_LABELS["D"], OUTCOME_LABELS["A"]],
                 "Probability": [pred["H"], pred["D"], pred["A"]],
             }
         )
-
-        winner_key = max(["H", "D", "A"], key=lambda k: pred[k])
-        winner_label = {"H": "Home Win", "D": "Draw", "A": "Away Win"}[winner_key]
-
-        st.success(f"Most likely outcome: {winner_label}")
-        st.dataframe(probs, use_container_width=True, hide_index=True)
         st.bar_chart(probs.set_index("Outcome"))
 
 
@@ -78,6 +81,13 @@ def render_single_fixture(teams: list[str], artifact: dict) -> None:
 def render_batch_prediction(artifact: dict) -> None:
     st.subheader("Batch Prediction from CSV")
     st.caption("Upload a CSV with columns: HomeTeam, AwayTeam")
+    sample_csv = "HomeTeam,AwayTeam\nArsenal,Chelsea\nLiverpool,Man City\n"
+    st.download_button(
+        "Download sample CSV",
+        data=sample_csv.encode("utf-8"),
+        file_name="fixtures_sample.csv",
+        mime="text/csv",
+    )
 
     uploaded = st.file_uploader("Fixtures CSV", type=["csv"])
     if uploaded is None:
@@ -88,36 +98,52 @@ def render_batch_prediction(artifact: dict) -> None:
     if not required.issubset(set(fixtures.columns)):
         st.error("CSV must contain columns: HomeTeam, AwayTeam")
         return
+    if fixtures.empty:
+        st.warning("The uploaded CSV is empty.")
+        return
 
     st.write("Input preview")
     st.dataframe(fixtures.head(20), use_container_width=True)
 
     if st.button("Run Batch Prediction"):
         rows = []
+        errors = []
         progress = st.progress(0)
         total = len(fixtures)
 
         for i, (_, row) in enumerate(fixtures.iterrows(), start=1):
-            rows.append(
-                predict_one(
-                    home=str(row["HomeTeam"]),
-                    away=str(row["AwayTeam"]),
-                    artifact=artifact,
+            home = str(row["HomeTeam"]).strip()
+            away = str(row["AwayTeam"]).strip()
+            try:
+                rows.append(
+                    predict_one(
+                        home=home,
+                        away=away,
+                        artifact=artifact,
+                    )
                 )
-            )
+            except Exception as exc:
+                errors.append({"HomeTeam": home, "AwayTeam": away, "Error": str(exc)})
             progress.progress(i / total)
 
         out = pd.DataFrame(rows)
-        st.success(f"Generated predictions for {len(out)} fixtures.")
-        st.dataframe(out, use_container_width=True)
+        if not out.empty:
+            st.success(f"Generated predictions for {len(out)} fixtures.")
+            st.dataframe(out, use_container_width=True)
 
-        csv_bytes = out.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download Predictions CSV",
-            data=csv_bytes,
-            file_name="predictions.csv",
-            mime="text/csv",
-        )
+            csv_bytes = out.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download Predictions CSV",
+                data=csv_bytes,
+                file_name="predictions.csv",
+                mime="text/csv",
+            )
+        else:
+            st.warning("No valid fixtures were predicted from this file.")
+
+        if errors:
+            st.error(f"{len(errors)} fixture(s) could not be predicted.")
+            st.dataframe(pd.DataFrame(errors), use_container_width=True, hide_index=True)
 
 
 
