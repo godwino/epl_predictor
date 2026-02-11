@@ -3,8 +3,11 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+from sklearn.compose import ColumnTransformer
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
-from epl_features import load_matches
+from epl_features import build_advanced_features, load_matches
 from predict_match import _predict_fixture
 
 DATA_DIR = Path(__file__).resolve().parent
@@ -22,11 +25,58 @@ def get_teams() -> list[str]:
 @st.cache_resource
 def load_artifact() -> dict:
     if not ARTIFACT_PATH.exists():
-        raise FileNotFoundError(
-            f"{ARTIFACT_PATH.name} not found. Run `python -B advanced_train.py` first."
+        st.warning(
+            f"{ARTIFACT_PATH.name} not found. Using runtime fallback model."
         )
-    with ARTIFACT_PATH.open("rb") as f:
-        return pickle.load(f)
+        return build_fallback_artifact()
+    try:
+        with ARTIFACT_PATH.open("rb") as f:
+            return pickle.load(f)
+    except Exception as exc:
+        st.warning(
+            f"Could not load {ARTIFACT_PATH.name} ({exc}). Using runtime fallback model."
+        )
+        return build_fallback_artifact()
+
+
+@st.cache_resource
+def build_fallback_artifact() -> dict:
+    df = load_matches().copy()
+    feats = build_advanced_features(df, window=5)
+    X = feats.drop(columns=["FTR", "Date"])
+    y = feats["FTR"]
+
+    cat_cols = ["HomeTeam", "AwayTeam", "SeasonKey"]
+    num_cols = [c for c in X.columns if c not in cat_cols]
+
+    try:
+        encoder = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+    except TypeError:
+        encoder = OneHotEncoder(handle_unknown="ignore", sparse=False)
+
+    preprocessor = ColumnTransformer(
+        [
+            ("cat", encoder, cat_cols),
+            ("num", StandardScaler(), num_cols),
+        ]
+    )
+    X_processed = preprocessor.fit_transform(X)
+
+    label_map = {"H": 0, "D": 1, "A": 2}
+    y_enc = y.map(label_map).values
+    model = LogisticRegression(max_iter=400, multi_class="multinomial", random_state=42)
+    model.fit(X_processed, y_enc)
+
+    inv_label_map = {v: k for k, v in label_map.items()}
+    return {
+        "model_name": "LogReg (fallback)",
+        "model": model,
+        "preprocessor": preprocessor,
+        "feature_columns": list(X.columns),
+        "label_map": label_map,
+        "inv_label_map": inv_label_map,
+        "window": 5,
+    }
 
 
 def predict_one(home: str, away: str, artifact: dict) -> dict:
