@@ -4,7 +4,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from advanced_train import load_matches
+from epl_features import load_matches
 from predict_match import _predict_fixture
 
 DATA_DIR = Path(__file__).resolve().parent

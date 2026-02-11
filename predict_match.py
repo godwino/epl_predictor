@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from advanced_train import build_advanced_features, load_matches
+from epl_features import build_advanced_features, load_matches
 
 DATA_DIR = Path(__file__).resolve().parent
 ARTIFACT_PATH = DATA_DIR / "advanced_model.pkl"
