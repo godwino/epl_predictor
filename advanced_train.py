@@ -12,11 +12,8 @@ import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import accuracy_score, classification_report, roc_auc_score, log_loss
 from sklearn.linear_model import LogisticRegression
-from xgboost import XGBClassifier
-from lightgbm import LGBMClassifier
 
 warnings.filterwarnings('ignore')
 
@@ -268,6 +265,11 @@ def train_advanced_ensemble(features: pd.DataFrame) -> dict:
     print("\n" + "="*70)
     print("ENSEMBLE MODEL TRAINING")
     print("="*70)
+
+    # Import training-only libraries lazily so inference environments
+    # don't need to install them just to import this module.
+    from xgboost import XGBClassifier
+    from lightgbm import LGBMClassifier
 
     models = {}
     predictions = {}

@@ -11,6 +11,11 @@
 pip install -r requirements.txt
 ```
 
+For model training dependencies (XGBoost/LightGBM), also install:
+```
+pip install -r requirements-train.txt
+```
+
 ## Run baseline training
 ```
 python train.py
