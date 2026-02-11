@@ -1,5 +1,8 @@
 # EPL Win/Draw/Loss Predictor (Local)
 
+## Live App
+- Streamlit: https://share.streamlit.io/user/godwino
+
 ## Setup
 1) Create a virtual env (optional)
 2) Install deps:
