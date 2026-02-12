@@ -23,9 +23,7 @@ def load_matches() -> pd.DataFrame:
     if not files:
         raise FileNotFoundError("No season-*.csv files found in the project folder.")
 
-    # Last 10 full seasons: 1415 .. 2324 (exclude 2425 partial)
-    allowed = {"1415", "1516", "1617", "1718", "1819", "1920", "2021", "2122", "2223", "2324"}
-    selected = [f for f in files if _season_key(f) in allowed]
+    selected = [f for f in files if _season_key(f)]
 
     frames = []
     for f in selected:
@@ -167,15 +165,19 @@ def train_and_eval(features: pd.DataFrame) -> None:
     X = features.drop(columns=["FTR", "Date"])
     y = features["FTR"]
 
+    seasons = sorted(features["SeasonKey"].dropna().unique().tolist())
+    holdout_season = seasons[-1]
+    val_season = seasons[-2] if len(seasons) > 1 else None
+
     # Hold out last season for testing
-    train_mask = features["SeasonKey"] != "2324"
+    train_mask = features["SeasonKey"] != holdout_season
     X_train = X[train_mask]
     y_train = y[train_mask]
     X_test = X[~train_mask]
     y_test = y[~train_mask]
 
-    # Use 2223 as validation season to reduce overfitting
-    val_mask = X_train["SeasonKey"] == "2223"
+    # Use most recent train season as validation to reduce overfitting
+    val_mask = X_train["SeasonKey"] == val_season if val_season is not None else np.zeros(len(X_train), dtype=bool)
     X_val = X_train[val_mask]
     y_val = y_train[val_mask]
     X_train = X_train[~val_mask]
@@ -197,7 +199,7 @@ def train_and_eval(features: pd.DataFrame) -> None:
     lr_model.fit(X_train, y_train)
     lr_preds = lr_model.predict(X_test)
     lr_acc = accuracy_score(y_test, lr_preds)
-    print(f"[LogReg] Test accuracy (season 2324): {lr_acc:.3f}")
+    print(f"[LogReg] Test accuracy (season {holdout_season}): {lr_acc:.3f}")
     print(classification_report(y_test, lr_preds))
 
     # XGBoost: better non-linear model with regularization + early stopping
@@ -236,7 +238,7 @@ def train_and_eval(features: pd.DataFrame) -> None:
 
     xgb_preds = xgb.predict(X_test_enc)
     xgb_acc = accuracy_score(y_test_enc, xgb_preds)
-    print(f"[XGBoost] Test accuracy (season 2324): {xgb_acc:.3f}")
+    print(f"[XGBoost] Test accuracy (season {holdout_season}): {xgb_acc:.3f}")
     print(classification_report(y_test_enc, xgb_preds, target_names=["H", "D", "A"]))
 
 

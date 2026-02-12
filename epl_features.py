@@ -18,8 +18,7 @@ def load_matches() -> pd.DataFrame:
     if not files:
         raise FileNotFoundError("No season-*.csv files found.")
 
-    allowed = {"1415", "1516", "1617", "1718", "1819", "1920", "2021", "2122", "2223", "2324"}
-    selected = [f for f in files if _season_key(f) in allowed]
+    selected = [f for f in files if _season_key(f)]
 
     frames = []
     for f in selected:
@@ -36,7 +35,11 @@ def load_matches() -> pd.DataFrame:
 
 def build_advanced_features(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
     history = defaultdict(lambda: deque(maxlen=window))
+    home_history = defaultdict(lambda: deque(maxlen=window))
+    away_history = defaultdict(lambda: deque(maxlen=window))
     h2h_history = defaultdict(deque)
+    last_seen_date = {}
+    season_match_count = defaultdict(int)
     rows = []
 
     def to_int(val):
@@ -125,16 +128,45 @@ def build_advanced_features(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
             "h2h_advantage": float((h_wins - (len(h2h) - h_wins - draws)) / len(h2h)) if h2h else 0.0,
         }
 
+    def get_rest_days(team: str, cur_date: pd.Timestamp) -> float:
+        prev = last_seen_date.get(team)
+        if prev is None:
+            return 7.0
+        days = (cur_date - prev).days
+        return float(max(0, min(days, 21)))
+
+    def get_venue_form(team: str, at_home: bool) -> dict:
+        venue_hist = home_history[team] if at_home else away_history[team]
+        if not venue_hist:
+            return {"pts_avg": 0.0, "gd_avg": 0.0}
+        pts = [x[0] for x in venue_hist]
+        gf = [x[1] for x in venue_hist]
+        ga = [x[2] for x in venue_hist]
+        return {
+            "pts_avg": float(np.mean(pts)),
+            "gd_avg": float(np.mean(gf) - np.mean(ga)),
+        }
+
     for _, r in df.iterrows():
+        cur_date = r["Date"]
+        season_key = r["SeasonKey"]
         home = r["HomeTeam"]
         away = r["AwayTeam"]
         h_stats = get_form_stats(home)
         a_stats = get_form_stats(away)
         h2h = get_h2h_stats(home, away)
+        h_home_form = get_venue_form(home, at_home=True)
+        a_away_form = get_venue_form(away, at_home=False)
+        home_rest_days = get_rest_days(home, cur_date)
+        away_rest_days = get_rest_days(away, cur_date)
+        match_no = season_match_count[season_key]
+        matchweek = int(match_no // 10) + 1
+        season_progress = min(matchweek / 38.0, 1.0)
+        is_midweek = 1.0 if int(cur_date.dayofweek) in {1, 2, 3} else 0.0
 
         rows.append({
-            "Date": r["Date"],
-            "SeasonKey": r["SeasonKey"],
+            "Date": cur_date,
+            "SeasonKey": season_key,
             "HomeTeam": home,
             "AwayTeam": away,
             "home_pts_avg": h_stats["pts_avg"],
@@ -163,6 +195,17 @@ def build_advanced_features(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
             "away_reds_avg": a_stats["reds_avg"],
             "away_consistency": a_stats["consistency"],
             "away_momentum": a_stats["momentum"],
+            "home_home_pts_avg": h_home_form["pts_avg"],
+            "home_home_gd_avg": h_home_form["gd_avg"],
+            "away_away_pts_avg": a_away_form["pts_avg"],
+            "away_away_gd_avg": a_away_form["gd_avg"],
+            "home_away_split_adv": h_home_form["pts_avg"] - a_away_form["pts_avg"],
+            "home_rest_days": home_rest_days,
+            "away_rest_days": away_rest_days,
+            "rest_days_diff": home_rest_days - away_rest_days,
+            "season_matchweek": float(matchweek),
+            "season_progress": season_progress,
+            "is_midweek": is_midweek,
             "h2h_h_pts": h2h["h2h_h_pts"],
             "h2h_draws": h2h["h2h_draws"],
             "h2h_advantage": h2h["h2h_advantage"],
@@ -188,6 +231,11 @@ def build_advanced_features(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
             to_int(r.get("AC", 0)), to_int(r.get("AF", 0)),
             to_int(r.get("AY", 0)), to_int(r.get("AR", 0)),
         ))
+        home_history[home].append((h_pts, to_int(r["FTHG"]), to_int(r["FTAG"])))
+        away_history[away].append((a_pts, to_int(r["FTAG"]), to_int(r["FTHG"])))
+        last_seen_date[home] = cur_date
+        last_seen_date[away] = cur_date
+        season_match_count[season_key] += 1
 
         h2h_key = tuple(sorted([home, away]))
         h2h_history[h2h_key].append((r["FTR"], home))

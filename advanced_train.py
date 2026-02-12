@@ -12,13 +12,16 @@ import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.metrics import accuracy_score, classification_report, roc_auc_score, log_loss
+from sklearn.metrics import accuracy_score, classification_report, roc_auc_score, log_loss, f1_score
 from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import ParameterGrid
 
 warnings.filterwarnings('ignore')
 
 DATA_DIR = Path(__file__).resolve().parent
 ARTIFACT_PATH = DATA_DIR / "advanced_model.pkl"
+BASELINE_ARTIFACT_PATH = DATA_DIR / "model_baseline.pkl"
+ADVANCED_ARTIFACT_PATH = DATA_DIR / "model_advanced.pkl"
 
 def _season_key(path: Path) -> str:
     m = re.search(r"season-(\d{4})\.csv", path.name)
@@ -31,8 +34,7 @@ def load_matches() -> pd.DataFrame:
     if not files:
         raise FileNotFoundError("No season-*.csv files found.")
 
-    allowed = {"1415", "1516", "1617", "1718", "1819", "1920", "2021", "2122", "2223", "2324"}
-    selected = [f for f in files if _season_key(f) in allowed]
+    selected = [f for f in files if _season_key(f)]
 
     frames = []
     for f in selected:
@@ -56,7 +58,11 @@ def build_advanced_features(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
     - Strength metrics
     """
     history = defaultdict(lambda: deque(maxlen=window))
+    home_history = defaultdict(lambda: deque(maxlen=window))
+    away_history = defaultdict(lambda: deque(maxlen=window))
     h2h_history = defaultdict(deque)  # Head-to-head records
+    last_seen_date = {}
+    season_match_count = defaultdict(int)
     rows = []
 
     def to_int(val):
@@ -153,17 +159,46 @@ def build_advanced_features(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
             "h2h_advantage": float((h_wins - (len(h2h) - h_wins - draws)) / len(h2h)) if h2h else 0.0,
         }
 
+    def get_rest_days(team: str, cur_date: pd.Timestamp) -> float:
+        prev = last_seen_date.get(team)
+        if prev is None:
+            return 7.0
+        days = (cur_date - prev).days
+        return float(max(0, min(days, 21)))
+
+    def get_venue_form(team: str, at_home: bool) -> dict:
+        venue_hist = home_history[team] if at_home else away_history[team]
+        if not venue_hist:
+            return {"pts_avg": 0.0, "gd_avg": 0.0}
+        pts = [x[0] for x in venue_hist]
+        gf = [x[1] for x in venue_hist]
+        ga = [x[2] for x in venue_hist]
+        return {
+            "pts_avg": float(np.mean(pts)),
+            "gd_avg": float(np.mean(gf) - np.mean(ga)),
+        }
+
     for _, r in df.iterrows():
+        cur_date = r["Date"]
+        season_key = r["SeasonKey"]
         home = r["HomeTeam"]
         away = r["AwayTeam"]
 
         h_stats = get_form_stats(home)
         a_stats = get_form_stats(away)
         h2h = get_h2h_stats(home, away)
+        h_home_form = get_venue_form(home, at_home=True)
+        a_away_form = get_venue_form(away, at_home=False)
+        home_rest_days = get_rest_days(home, cur_date)
+        away_rest_days = get_rest_days(away, cur_date)
+        match_no = season_match_count[season_key]
+        matchweek = int(match_no // 10) + 1
+        season_progress = min(matchweek / 38.0, 1.0)
+        is_midweek = 1.0 if int(cur_date.dayofweek) in {1, 2, 3} else 0.0
 
         rows.append({
-            "Date": r["Date"],
-            "SeasonKey": r["SeasonKey"],
+            "Date": cur_date,
+            "SeasonKey": season_key,
             "HomeTeam": home,
             "AwayTeam": away,
             # Home stats
@@ -194,6 +229,17 @@ def build_advanced_features(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
             "away_reds_avg": a_stats["reds_avg"],
             "away_consistency": a_stats["consistency"],
             "away_momentum": a_stats["momentum"],
+            "home_home_pts_avg": h_home_form["pts_avg"],
+            "home_home_gd_avg": h_home_form["gd_avg"],
+            "away_away_pts_avg": a_away_form["pts_avg"],
+            "away_away_gd_avg": a_away_form["gd_avg"],
+            "home_away_split_adv": h_home_form["pts_avg"] - a_away_form["pts_avg"],
+            "home_rest_days": home_rest_days,
+            "away_rest_days": away_rest_days,
+            "rest_days_diff": home_rest_days - away_rest_days,
+            "season_matchweek": float(matchweek),
+            "season_progress": season_progress,
+            "is_midweek": is_midweek,
             # H2H
             "h2h_h_pts": h2h["h2h_h_pts"],
             "h2h_draws": h2h["h2h_draws"],
@@ -222,6 +268,11 @@ def build_advanced_features(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
             to_int(r.get("AC", 0)), to_int(r.get("AF", 0)),
             to_int(r.get("AY", 0)), to_int(r.get("AR", 0)),
         ))
+        home_history[home].append((h_pts, to_int(r["FTHG"]), to_int(r["FTAG"])))
+        away_history[away].append((a_pts, to_int(r["FTAG"]), to_int(r["FTHG"])))
+        last_seen_date[home] = cur_date
+        last_seen_date[away] = cur_date
+        season_match_count[season_key] += 1
 
         # Update H2H
         h2h_key = tuple(sorted([home, away]))
@@ -238,27 +289,55 @@ def train_advanced_ensemble(features: pd.DataFrame) -> dict:
     X = features.drop(columns=["FTR", "Date"])
     y = features["FTR"]
 
+    seasons = sorted(features["SeasonKey"].dropna().unique().tolist())
+    if len(seasons) < 3:
+        raise ValueError("Need at least 3 seasons to run train/validation/test splits.")
+
+    holdout_season = seasons[-1]
+    val_season = seasons[-2]
+
     # Train/test split
-    train_mask = features["SeasonKey"] != "2324"
+    train_mask = features["SeasonKey"] != holdout_season
     X_train = X[train_mask].copy()
     y_train = y[train_mask].copy()
     X_test = X[~train_mask].copy()
     y_test = y[~train_mask].copy()
 
+    # Use a season-aware validation split for light hyperparameter tuning.
+    val_mask = train_mask & (features["SeasonKey"] == val_season)
+    tune_train_mask = train_mask & ~val_mask
+    if int(val_mask.sum()) == 0 or int(tune_train_mask.sum()) == 0:
+        val_mask = train_mask
+        tune_train_mask = train_mask
+
+    X_tune_train = X[tune_train_mask].copy()
+    y_tune_train = y[tune_train_mask].copy()
+    X_val = X[val_mask].copy()
+    y_val = y[val_mask].copy()
+
     # Preprocessing
     cat_cols = ["HomeTeam", "AwayTeam", "SeasonKey"]
     num_cols = [c for c in X.columns if c not in cat_cols]
+
+    tune_preprocessor = ColumnTransformer([
+        ("cat", OneHotEncoder(handle_unknown="ignore", sparse_output=False), cat_cols),
+        ("num", StandardScaler(), num_cols),
+    ])
+
+    X_tune_processed = tune_preprocessor.fit_transform(X_tune_train)
+    X_val_processed = tune_preprocessor.transform(X_val)
 
     preprocessor = ColumnTransformer([
         ("cat", OneHotEncoder(handle_unknown="ignore", sparse_output=False), cat_cols),
         ("num", StandardScaler(), num_cols),
     ])
-
     X_train_processed = preprocessor.fit_transform(X_train)
     X_test_processed = preprocessor.transform(X_test)
 
     # Label encoding
     label_map = {"H": 0, "D": 1, "A": 2}
+    y_tune_enc = y_tune_train.map(label_map).values
+    y_val_enc = y_val.map(label_map).values
     y_train_enc = y_train.map(label_map).values
     y_test_enc = y_test.map(label_map).values
 
@@ -271,24 +350,79 @@ def train_advanced_ensemble(features: pd.DataFrame) -> dict:
     from xgboost import XGBClassifier
     from lightgbm import LGBMClassifier
 
+    def predict_with_thresholds(proba: np.ndarray, thresholds: dict) -> np.ndarray:
+        scale = np.array(
+            [
+                max(float(thresholds.get("H", 0.5)), 1e-6),
+                max(float(thresholds.get("D", 0.5)), 1e-6),
+                max(float(thresholds.get("A", 0.5)), 1e-6),
+            ]
+        )
+        return np.argmax(proba / scale, axis=1)
+
+    def tune_decision_thresholds(y_true: np.ndarray, proba: np.ndarray) -> dict:
+        best = {"H": 0.5, "D": 0.5, "A": 0.5}
+        best_score = -1.0
+        for h_t in [0.45, 0.50, 0.55]:
+            for d_t in [0.22, 0.26, 0.30, 0.34]:
+                for a_t in [0.45, 0.50, 0.55]:
+                    candidate = {"H": h_t, "D": d_t, "A": a_t}
+                    pred = predict_with_thresholds(proba, candidate)
+                    acc = accuracy_score(y_true, pred)
+                    mf1 = f1_score(y_true, pred, average="macro", zero_division=0)
+                    score = 0.6 * acc + 0.4 * mf1
+                    if score > best_score:
+                        best_score = score
+                        best = candidate
+        return best
+
+    def select_best_params(name: str, model_cls, base_params: dict, grid_params: dict) -> dict:
+        best_score = -1.0
+        best_params = {}
+        print(f"  Tuning {name} on season {val_season} validation set...")
+        for params in ParameterGrid(grid_params):
+            candidate_params = dict(base_params)
+            candidate_params.update(params)
+            model = model_cls(**candidate_params)
+            model.fit(X_tune_processed, y_tune_enc)
+            pred = model.predict(X_val_processed)
+            val_acc = accuracy_score(y_val_enc, pred)
+            val_macro_f1 = f1_score(y_val_enc, pred, average="macro", zero_division=0)
+            # Blend of accuracy and macro-F1 to slightly improve class balance.
+            score = 0.7 * val_acc + 0.3 * val_macro_f1
+            if score > best_score:
+                best_score = score
+                best_params = params
+        print(f"  Best {name} params: {best_params} (blended score: {best_score:.4f})")
+        return best_params
+
     models = {}
     predictions = {}
+    decision_thresholds = {}
 
     # Model 1: XGBoost
     print("\n[1/3] Training XGBoost...")
-    xgb = XGBClassifier(
-        objective="multi:softprob",
-        num_class=3,
-        n_estimators=500,
-        learning_rate=0.05,
-        max_depth=5,
-        min_child_weight=3,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_alpha=1.0,
-        reg_lambda=1.0,
-        random_state=42,
-    )
+    xgb_base_params = {
+        "objective": "multi:softprob",
+        "num_class": 3,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "reg_alpha": 1.0,
+        "reg_lambda": 1.0,
+        "random_state": 42,
+    }
+    xgb_grid = {
+        "n_estimators": [350, 500],
+        "learning_rate": [0.03, 0.05],
+        "max_depth": [4, 5],
+        "min_child_weight": [2],
+    }
+    xgb_best = select_best_params("XGBoost", XGBClassifier, xgb_base_params, xgb_grid)
+    xgb_tune = XGBClassifier(**{**xgb_base_params, **xgb_best})
+    xgb_tune.fit(X_tune_processed, y_tune_enc, verbose=False)
+    decision_thresholds["XGBoost"] = tune_decision_thresholds(y_val_enc, xgb_tune.predict_proba(X_val_processed))
+    print(f"  XGBoost thresholds: {decision_thresholds['XGBoost']}")
+    xgb = XGBClassifier(**{**xgb_base_params, **xgb_best})
     xgb.fit(X_train_processed, y_train_enc, verbose=False)
     xgb_pred = xgb.predict(X_test_processed)
     xgb_proba = xgb.predict_proba(X_test_processed)
@@ -297,19 +431,27 @@ def train_advanced_ensemble(features: pd.DataFrame) -> dict:
 
     # Model 2: LightGBM
     print("[2/3] Training LightGBM...")
-    lgb = LGBMClassifier(
-        num_class=3,
-        n_estimators=500,
-        learning_rate=0.05,
-        num_leaves=31,
-        min_child_samples=20,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_alpha=1.0,
-        reg_lambda=1.0,
-        random_state=42,
-        verbose=-1,
-    )
+    lgb_base_params = {
+        "num_class": 3,
+        "min_child_samples": 20,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "reg_alpha": 1.0,
+        "reg_lambda": 1.0,
+        "random_state": 42,
+        "verbose": -1,
+    }
+    lgb_grid = {
+        "n_estimators": [300, 500],
+        "learning_rate": [0.03, 0.05],
+        "num_leaves": [31, 63],
+    }
+    lgb_best = select_best_params("LightGBM", LGBMClassifier, lgb_base_params, lgb_grid)
+    lgb_tune = LGBMClassifier(**{**lgb_base_params, **lgb_best})
+    lgb_tune.fit(X_tune_processed, y_tune_enc)
+    decision_thresholds["LightGBM"] = tune_decision_thresholds(y_val_enc, lgb_tune.predict_proba(X_val_processed))
+    print(f"  LightGBM thresholds: {decision_thresholds['LightGBM']}")
+    lgb = LGBMClassifier(**{**lgb_base_params, **lgb_best})
     lgb.fit(X_train_processed, y_train_enc)
     lgb_pred = lgb.predict(X_test_processed)
     lgb_proba = lgb.predict_proba(X_test_processed)
@@ -318,7 +460,21 @@ def train_advanced_ensemble(features: pd.DataFrame) -> dict:
 
     # Model 3: Logistic Regression (for baseline/calibration)
     print("[3/3] Training Logistic Regression...")
-    lr = LogisticRegression(max_iter=300, multi_class="multinomial", random_state=42)
+    lr_base_params = {
+        "max_iter": 500,
+        "multi_class": "multinomial",
+        "random_state": 42,
+    }
+    lr_grid = {
+        "C": [0.5, 1.0, 2.0],
+        "class_weight": [None, "balanced"],
+    }
+    lr_best = select_best_params("LogReg", LogisticRegression, lr_base_params, lr_grid)
+    lr_tune = LogisticRegression(**{**lr_base_params, **lr_best})
+    lr_tune.fit(X_tune_processed, y_tune_enc)
+    decision_thresholds["LogReg"] = tune_decision_thresholds(y_val_enc, lr_tune.predict_proba(X_val_processed))
+    print(f"  LogReg thresholds: {decision_thresholds['LogReg']}")
+    lr = LogisticRegression(**{**lr_base_params, **lr_best})
     lr.fit(X_train_processed, y_train_enc)
     lr_pred = lr.predict(X_test_processed)
     lr_proba = lr.predict_proba(X_test_processed)
@@ -334,7 +490,7 @@ def train_advanced_ensemble(features: pd.DataFrame) -> dict:
 
     # Evaluate all models
     print("\n" + "="*70)
-    print("MODEL PERFORMANCE (Season 2324 - Test Set)")
+    print(f"MODEL PERFORMANCE (Season {holdout_season} - Test Set)")
     print("="*70)
 
     results = {}
@@ -350,10 +506,26 @@ def train_advanced_ensemble(features: pd.DataFrame) -> dict:
         # Log loss
         ll = log_loss(y_test_enc, proba)
 
-        results[name] = {"accuracy": acc, "auc": auc, "logloss": ll}
+        thresholded_acc = acc
+        thresholded_macro_f1 = f1_score(y_test_enc, pred, average="macro", zero_division=0)
+        if name in decision_thresholds:
+            thresholded_pred = predict_with_thresholds(proba, decision_thresholds[name])
+            thresholded_acc = accuracy_score(y_test_enc, thresholded_pred)
+            thresholded_macro_f1 = f1_score(y_test_enc, thresholded_pred, average="macro", zero_division=0)
+
+        results[name] = {
+            "accuracy": acc,
+            "auc": auc,
+            "logloss": ll,
+            "thresholded_accuracy": thresholded_acc,
+            "thresholded_macro_f1": thresholded_macro_f1,
+        }
 
         print(f"\n[{name}]")
         print(f"  Accuracy:  {acc:.4f}")
+        if name in decision_thresholds:
+            print(f"  Thresholded Accuracy: {thresholded_acc:.4f}")
+            print(f"  Thresholded Macro-F1: {thresholded_macro_f1:.4f}")
         print(f"  ROC-AUC:   {auc:.4f}")
         print(f"  Log Loss:  {ll:.4f}")
         print("\n  Classification Report:")
@@ -373,8 +545,8 @@ def train_advanced_ensemble(features: pd.DataFrame) -> dict:
         "importance": xgb.feature_importances_
     }).nlargest(20, "importance")
     
-    for idx, row in importance.iterrows():
-        print(f"  Feature {row['feature']}: {row['importance']:.4f}")
+    for _, row in importance.iterrows():
+        print(f"  Feature {int(row['feature'])}: {row['importance']:.4f}")
 
     return {
         "models": models,
@@ -382,35 +554,76 @@ def train_advanced_ensemble(features: pd.DataFrame) -> dict:
         "feature_columns": list(X.columns),
         "label_map": label_map,
         "predictions": predictions,
+        "decision_thresholds": decision_thresholds,
         "results": results,
         "y_test": y_test.values,
         "test_indices": ~train_mask,
+        "holdout_season": holdout_season,
     }
 
 
-def save_artifacts(training_output: dict, window: int = 5) -> Path:
-    """Persist best deployable model and preprocessing objects for inference."""
-    deployable = ["XGBoost", "LightGBM", "LogReg"]
-    best_name = max(
-        ((k, v) for k, v in training_output["results"].items() if k in deployable),
-        key=lambda x: x[1]["accuracy"]
-    )[0]
-
+def _build_payload(training_output: dict, model_name: str, window: int = 5) -> dict:
     label_map = training_output["label_map"]
     inv_label_map = {v: k for k, v in label_map.items()}
-    payload = {
-        "model_name": best_name,
-        "model": training_output["models"][best_name],
+    return {
+        "model_name": model_name,
+        "model": training_output["models"][model_name],
         "preprocessor": training_output["preprocessor"],
         "feature_columns": training_output["feature_columns"],
         "label_map": label_map,
         "inv_label_map": inv_label_map,
         "window": window,
+        "decision_thresholds": training_output.get("decision_thresholds", {}).get(
+            model_name, {"H": 0.5, "D": 0.5, "A": 0.5}
+        ),
+        "holdout_season": training_output.get("holdout_season"),
+    }
+
+
+def save_artifacts(training_output: dict, window: int = 5) -> dict:
+    """
+    Persist:
+    - Baseline model artifact (LogReg)
+    - Advanced model artifact (best of XGBoost/LightGBM by holdout accuracy)
+    - Deployment artifact (best of baseline vs advanced by holdout accuracy)
+    """
+    results = training_output["results"]
+    baseline_name = "LogReg"
+    advanced_candidates = ["XGBoost", "LightGBM"]
+    advanced_name = max(advanced_candidates, key=lambda k: results[k]["accuracy"])
+
+    baseline_payload = _build_payload(training_output, baseline_name, window=window)
+    advanced_payload = _build_payload(training_output, advanced_name, window=window)
+
+    with BASELINE_ARTIFACT_PATH.open("wb") as f:
+        pickle.dump(baseline_payload, f)
+    with ADVANCED_ARTIFACT_PATH.open("wb") as f:
+        pickle.dump(advanced_payload, f)
+
+    baseline_acc = float(results[baseline_name]["accuracy"])
+    advanced_acc = float(results[advanced_name]["accuracy"])
+    deployed_name = advanced_name if advanced_acc >= baseline_acc else baseline_name
+    deployed_payload = advanced_payload if deployed_name == advanced_name else baseline_payload
+    deployed_payload = dict(deployed_payload)
+    deployed_payload["deployment_selected_by"] = "holdout_accuracy"
+    deployed_payload["deployment_candidates"] = {
+        baseline_name: baseline_acc,
+        advanced_name: advanced_acc,
     }
 
     with ARTIFACT_PATH.open("wb") as f:
-        pickle.dump(payload, f)
-    return ARTIFACT_PATH
+        pickle.dump(deployed_payload, f)
+
+    return {
+        "baseline_path": BASELINE_ARTIFACT_PATH,
+        "advanced_path": ADVANCED_ARTIFACT_PATH,
+        "deploy_path": ARTIFACT_PATH,
+        "baseline_model": baseline_name,
+        "advanced_model": advanced_name,
+        "deployed_model": deployed_name,
+        "baseline_accuracy": baseline_acc,
+        "advanced_accuracy": advanced_acc,
+    }
 
 
 def main():
@@ -434,10 +647,21 @@ def main():
     print("SUMMARY")
     print("="*70)
     best_model = max(results["results"].items(), key=lambda x: x[1]["accuracy"])
-    print(f"\nBest Model: {best_model[0]} (Accuracy: {best_model[1]['accuracy']:.4f})")
+    print(f"\nHoldout season: {results.get('holdout_season')}")
+    print(
+        f"Best Model: {best_model[0]} "
+        f"(Accuracy: {best_model[1]['accuracy']:.4f})"
+    )
 
-    artifact_path = save_artifacts(results, window=5)
-    print(f"Saved deployable artifact: {artifact_path.name}")
+    artifact_paths = save_artifacts(results, window=5)
+    print(f"Saved baseline artifact: {artifact_paths['baseline_path'].name}")
+    print(f"Saved advanced artifact: {artifact_paths['advanced_path'].name}")
+    print(
+        f"Deployment selected: {artifact_paths['deployed_model']} "
+        f"(baseline={artifact_paths['baseline_accuracy']:.4f}, "
+        f"advanced={artifact_paths['advanced_accuracy']:.4f})"
+    )
+    print(f"Saved deployable artifact: {artifact_paths['deploy_path'].name}")
     print("\nAdvanced training complete!")
 
 

@@ -1,4 +1,6 @@
 import pickle
+import importlib.util
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -13,6 +15,21 @@ from predict_match import _predict_fixture
 DATA_DIR = Path(__file__).resolve().parent
 ARTIFACT_PATH = DATA_DIR / "advanced_model.pkl"
 OUTCOME_LABELS = {"H": "Home Win", "D": "Draw", "A": "Away Win"}
+
+
+def collect_startup_checks() -> dict:
+    """Collect dependency/artifact/runtime checks for clear startup diagnostics."""
+    checks = {
+        "python": sys.executable,
+        "artifact_exists": ARTIFACT_PATH.exists(),
+        "required_packages": {},
+    }
+    for pkg in ["streamlit", "pandas", "sklearn"]:
+        checks["required_packages"][pkg] = importlib.util.find_spec(pkg) is not None
+    # Training/runtime model packages can be optional if fallback is used.
+    for pkg in ["xgboost", "lightgbm"]:
+        checks["required_packages"][pkg] = importlib.util.find_spec(pkg) is not None
+    return checks
 
 
 @st.cache_data
@@ -64,7 +81,11 @@ def build_fallback_artifact() -> dict:
 
     label_map = {"H": 0, "D": 1, "A": 2}
     y_enc = y.map(label_map).values
-    model = LogisticRegression(max_iter=400, multi_class="multinomial", random_state=42)
+    try:
+        model = LogisticRegression(max_iter=400, multi_class="multinomial", random_state=42)
+    except TypeError:
+        # Compatibility for sklearn versions where `multi_class` is not accepted.
+        model = LogisticRegression(max_iter=400, random_state=42)
     model.fit(X_processed, y_enc)
 
     inv_label_map = {v: k for k, v in label_map.items()}
@@ -76,10 +97,18 @@ def build_fallback_artifact() -> dict:
         "label_map": label_map,
         "inv_label_map": inv_label_map,
         "window": 5,
+        "decision_thresholds": {"H": 0.5, "D": 0.5, "A": 0.5},
+        "holdout_season": None,
     }
 
 
-def predict_one(home: str, away: str, artifact: dict) -> dict:
+def predict_one(
+    home: str,
+    away: str,
+    artifact: dict,
+    home_last4: str | None = None,
+    away_last4: str | None = None,
+) -> dict:
     return _predict_fixture(
         model=artifact["model"],
         preprocessor=artifact["preprocessor"],
@@ -88,6 +117,9 @@ def predict_one(home: str, away: str, artifact: dict) -> dict:
         home=home,
         away=away,
         window=artifact.get("window", 5),
+        decision_thresholds=artifact.get("decision_thresholds", {"H": 0.5, "D": 0.5, "A": 0.5}),
+        home_last4=home_last4,
+        away_last4=away_last4,
     )
 
 
@@ -103,13 +135,25 @@ def render_single_fixture(teams: list[str], artifact: dict) -> None:
     with col2:
         away = st.selectbox("Away Team", teams, index=default_away)
 
+    c3, c4 = st.columns(2)
+    with c3:
+        home_last4 = st.text_input("Home Last 4 (optional, e.g. WDLW)", value="")
+    with c4:
+        away_last4 = st.text_input("Away Last 4 (optional, e.g. LDWW)", value="")
+
     if home == away:
         st.warning("Home and away teams must be different.")
         return
 
     if st.button("Predict Result", type="primary"):
-        pred = predict_one(home, away, artifact)
-        winner_key = max(["H", "D", "A"], key=lambda k: pred[k])
+        pred = predict_one(
+            home,
+            away,
+            artifact,
+            home_last4=home_last4.strip() or None,
+            away_last4=away_last4.strip() or None,
+        )
+        winner_key = pred["Prediction"]
         winner_label = OUTCOME_LABELS[winner_key]
 
         st.success(f"Most likely outcome: {winner_label}")
@@ -130,8 +174,12 @@ def render_single_fixture(teams: list[str], artifact: dict) -> None:
 
 def render_batch_prediction(artifact: dict) -> None:
     st.subheader("Batch Prediction from CSV")
-    st.caption("Upload a CSV with columns: HomeTeam, AwayTeam")
-    sample_csv = "HomeTeam,AwayTeam\nArsenal,Chelsea\nLiverpool,Man City\n"
+    st.caption("Upload a CSV with columns: HomeTeam, AwayTeam. Optional: HomeLast4, AwayLast4 (W/D/L strings).")
+    sample_csv = (
+        "HomeTeam,AwayTeam,HomeLast4,AwayLast4\n"
+        "Arsenal,Chelsea,WWDW,LDWW\n"
+        "Liverpool,Man City,WDWW,WWDL\n"
+    )
     st.download_button(
         "Download sample CSV",
         data=sample_csv.encode("utf-8"),
@@ -170,6 +218,8 @@ def render_batch_prediction(artifact: dict) -> None:
                         home=home,
                         away=away,
                         artifact=artifact,
+                        home_last4=str(row["HomeLast4"]).strip() if "HomeLast4" in fixtures.columns and pd.notna(row["HomeLast4"]) else None,
+                        away_last4=str(row["AwayLast4"]).strip() if "AwayLast4" in fixtures.columns and pd.notna(row["AwayLast4"]) else None,
                     )
                 )
             except Exception as exc:
@@ -201,6 +251,20 @@ def main() -> None:
     st.set_page_config(page_title="EPL Predictor", layout="wide")
     st.title("EPL Win/Draw/Loss Predictor")
     st.caption("Streamlit app for single and batch fixture predictions.")
+    checks = collect_startup_checks()
+
+    if not checks["artifact_exists"]:
+        st.warning(
+            f"`{ARTIFACT_PATH.name}` not found. The app will use fallback model. "
+            "Run `python -B advanced_train.py` to build the deployable model."
+        )
+
+    if not checks["required_packages"]["xgboost"]:
+        st.info(
+            "Package `xgboost` is not installed in this Python environment. "
+            "If your artifact uses XGBoost, fallback mode will be used. "
+            "Install with `pip install -r requirements-train.txt`."
+        )
 
     try:
         artifact = load_artifact()
@@ -213,6 +277,20 @@ def main() -> None:
         st.subheader("Model")
         st.write(f"Artifact: `{ARTIFACT_PATH.name}`")
         st.write(f"Selected model: `{artifact.get('model_name', 'Unknown')}`")
+        if artifact.get("holdout_season"):
+            st.write(f"Holdout season: `{artifact.get('holdout_season')}`")
+        if artifact.get("decision_thresholds"):
+            st.write(f"Thresholds: `{artifact.get('decision_thresholds')}`")
+        with st.expander("Startup Checks", expanded=False):
+            st.write(f"Python: `{checks['python']}`")
+            st.write(f"Artifact exists: `{checks['artifact_exists']}`")
+            dep_rows = pd.DataFrame(
+                [
+                    {"Package": k, "Available": v}
+                    for k, v in checks["required_packages"].items()
+                ]
+            )
+            st.dataframe(dep_rows, use_container_width=True, hide_index=True)
 
     teams = get_teams()
 
