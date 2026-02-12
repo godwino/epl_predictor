@@ -14,6 +14,7 @@ from predict_match import _predict_fixture
 
 DATA_DIR = Path(__file__).resolve().parent
 ARTIFACT_PATH = DATA_DIR / "advanced_model.pkl"
+BASELINE_ARTIFACT_PATH = DATA_DIR / "model_baseline.pkl"
 OUTCOME_LABELS = {"H": "Home Win", "D": "Draw", "A": "Away Win"}
 
 
@@ -49,6 +50,18 @@ def load_artifact() -> dict:
     try:
         with ARTIFACT_PATH.open("rb") as f:
             return pickle.load(f)
+    except ModuleNotFoundError as exc:
+        if BASELINE_ARTIFACT_PATH.exists():
+            st.warning(
+                f"Could not load {ARTIFACT_PATH.name} ({exc}). "
+                f"Loading {BASELINE_ARTIFACT_PATH.name} instead."
+            )
+            with BASELINE_ARTIFACT_PATH.open("rb") as f:
+                return pickle.load(f)
+        st.warning(
+            f"Could not load {ARTIFACT_PATH.name} ({exc}). Using runtime fallback model."
+        )
+        return build_fallback_artifact()
     except Exception as exc:
         st.warning(
             f"Could not load {ARTIFACT_PATH.name} ({exc}). Using runtime fallback model."
