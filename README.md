@@ -29,7 +29,7 @@ This writes `advanced_model.pkl` for inference.
 
 ## Run Streamlit app locally
 ```
-streamlit run app.py
+streamlit run streamlit_app.py
 ```
 
 ## Predict one fixture
@@ -77,5 +77,5 @@ git push -u origin main
 - Click "New app"
 - Select your GitHub repo
 - Branch: `main`
-- Main file path: `app.py`
+- Main file path: `streamlit_app.py`
 - Click "Deploy"
